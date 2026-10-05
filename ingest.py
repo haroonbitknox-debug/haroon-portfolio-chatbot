@@ -22,7 +22,8 @@ loader = DirectoryLoader(
     str(ROOT / "data"), glob="**/*.md", loader_cls=TextLoader, loader_kwargs={"encoding": "utf-8"}
 )
 docs = loader.load()
-
+for d in docs:
+    d.metadata["source"] = Path(d.metadata["source"]).stem
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=60,

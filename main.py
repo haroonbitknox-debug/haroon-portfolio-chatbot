@@ -14,8 +14,10 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+import logging
 
 load_dotenv()
+logger = logging.getLogger("uvicorn.error")
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
@@ -93,7 +95,7 @@ async def chat(request: Request, body: ChatRequest):
         try:
             docs = await retriever.ainvoke(body.message)
             context = "\n\n".join(d.page_content for d in docs)
-            sources = sorted({Path(d.metadata.get("source", "")).stem for d in docs} - {""})
+            sources = sorted({Path(d.metadata.get("source", "").replace("\\", "/")).stem for d in docs} - {""})
             yield sse({"type": "sources", "sources": sources})
 
             messages = prompt.format_messages(
@@ -106,7 +108,9 @@ async def chat(request: Request, body: ChatRequest):
                 if text:
                     yield sse({"type": "token", "text": text})
             yield sse({"type": "done"})
+        
         except Exception:
+            logger.exception("chat failed")
             yield sse({"type": "error", "message": "Something went wrong. Please try again."})
 
     return StreamingResponse(
