@@ -1,5 +1,8 @@
+import asyncio
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -14,12 +17,19 @@ from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-import logging
 
 load_dotenv()
 logger = logging.getLogger("uvicorn.error")
 
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+# Comma-separated, fastest/preferred first. Example:
+#   LLM_MODELS=gemini-3.8-flash,<another model from Google AI Studio>
+LLM_MODELS = [
+    m.strip()
+    for m in os.getenv("LLM_MODELS", os.getenv("LLM_MODEL", "gemini-3.8-flash")).split(",")
+    if m.strip()
+]
+# If a model has not produced anything after this many seconds, try the next one.
+FIRST_TOKEN_TIMEOUT = float(os.getenv("FIRST_TOKEN_TIMEOUT", "7"))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
 ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")]
 
@@ -41,7 +51,7 @@ store = FAISS.load_local(
     str(Path(__file__).parent / "index"), embeddings, allow_dangerous_deserialization=True
 )  # safe: the index is built by your own ingest.py
 retriever = store.as_retriever(search_kwargs={"k": 4})
-llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2)
+llms = {name: ChatGoogleGenerativeAI(model=name, temperature=0.2) for name in LLM_MODELS}
 
 prompt = ChatPromptTemplate.from_messages(
     [
@@ -82,6 +92,36 @@ def sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+async def stream_answer(messages, t0: float):
+    """Yield answer text. Tries each model in order and moves on if one fails
+    (404, quota, outage) or takes too long to start. The last model gets no timeout."""
+    last_error = None
+    for index, name in enumerate(LLM_MODELS):
+        is_last = index == len(LLM_MODELS) - 1
+        stream = llms[name].astream(messages)
+        try:
+            first = await asyncio.wait_for(
+                anext(stream), timeout=None if is_last else FIRST_TOKEN_TIMEOUT
+            )
+        except StopAsyncIteration:
+            return
+        except Exception as e:  # includes timeouts, 404s and 429s
+            last_error = e
+            print(f"[models] {name} failed before first token: {e!r}", flush=True)
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+            continue
+
+        print(f"[timing] first token {time.perf_counter() - t0:.2f}s from {name}", flush=True)
+        yield text_of(first)
+        async for chunk in stream:
+            yield text_of(chunk)
+        return
+    raise last_error or RuntimeError("No models configured")
+
+
 # --- Routes ------------------------------------------------------------------
 @app.get("/health")
 def health():
@@ -93,22 +133,26 @@ def health():
 async def chat(request: Request, body: ChatRequest):
     async def stream():
         try:
+            t0 = time.perf_counter()
+            yield sse({"type": "status", "phase": "search"})
             docs = await retriever.ainvoke(body.message)
+            print(f"[timing] retrieval {time.perf_counter() - t0:.2f}s", flush=True)
+
             context = "\n\n".join(d.page_content for d in docs)
             sources = sorted({Path(d.metadata.get("source", "").replace("\\", "/")).stem for d in docs} - {""})
             yield sse({"type": "sources", "sources": sources})
+            yield sse({"type": "status", "phase": "write"})
 
             messages = prompt.format_messages(
                 context=context,
                 history=[(t.role, t.content) for t in body.history],
                 question=body.message,
             )
-            async for chunk in llm.astream(messages):
-                text = text_of(chunk)
+            async for text in stream_answer(messages, t0):
                 if text:
                     yield sse({"type": "token", "text": text})
+            print(f"[timing] total {time.perf_counter() - t0:.2f}s", flush=True)
             yield sse({"type": "done"})
-        
         except Exception:
             logger.exception("chat failed")
             yield sse({"type": "error", "message": "Something went wrong. Please try again."})
